@@ -1,0 +1,122 @@
+name: Deploy static site
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-static-site
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Build and deploy to S3
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Load deployment variables
+        id: deploy-vars
+        shell: bash
+        env:
+          WELLINS_DIST: ${{ vars.WELLINS_DIST }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${WELLINS_DIST}" ]; then
+            echo "::error::Repository variable WELLINS_DIST is empty or missing."
+            exit 1
+          fi
+
+          while IFS= read -r line || [ -n "$line" ]; do
+            line="${line%$'\r'}"
+
+            if [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]]; then
+              continue
+            fi
+
+            if [[ "$line" != *=* ]]; then
+              echo "::error::Invalid WELLINS_DIST line: $line"
+              exit 1
+            fi
+
+            key="${line%%=*}"
+            value="${line#*=}"
+
+            if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+              echo "::error::Invalid WELLINS_DIST key: $key"
+              exit 1
+            fi
+
+            echo "$key=$value" >> "$GITHUB_ENV"
+            echo "$key=$value" >> "$GITHUB_OUTPUT"
+          done <<< "$WELLINS_DIST"
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.28.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build static export
+        run: pnpm build
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ steps.deploy-vars.outputs.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ steps.deploy-vars.outputs.AWS_REGION }}
+
+      - name: Upload versioned Next.js assets
+        run: |
+          aws s3 cp out/_next/static "s3://${S3_BUCKET}/_next/static" \
+            --recursive \
+            --cache-control "public,max-age=31536000,immutable" \
+            --only-show-errors
+
+      - name: Upload other static files
+        run: |
+          aws s3 cp out "s3://${S3_BUCKET}" \
+            --recursive \
+            --exclude "_next/static/*" \
+            --exclude "*.html" \
+            --exclude "*.txt" \
+            --cache-control "public,max-age=3600" \
+            --only-show-errors
+
+      - name: Upload pages and route data
+        run: |
+          aws s3 cp out "s3://${S3_BUCKET}" \
+            --recursive \
+            --exclude "*" \
+            --include "*.html" \
+            --include "*.txt" \
+            --exclude "_next/static/*" \
+            --cache-control "no-store" \
+            --only-show-errors
+
+      - name: Remove stale pages
+        run: |
+          aws s3 sync out "s3://${S3_BUCKET}" \
+            --delete \
+            --exclude "_next/static/*" \
+            --only-show-errors
+
+      - name: Invalidate CloudFront
+        run: aws cloudfront create-invalidation --distribution-id "${CLOUDFRONT_DISTRIBUTION_ID}" --paths "/*"

@@ -1,0 +1,724 @@
+"use client";
+
+import { SubmissionConfirmDialog } from "@/components/ui/submission-confirm-dialog";
+import Script from "next/script";
+import { type FormEvent, useCallback, useEffect, useRef, useState } from "react";
+
+const states = [
+  "Alabama",
+  "Alaska",
+  "Arizona",
+  "Arkansas",
+  "California",
+  "Colorado",
+  "Connecticut",
+  "Delaware",
+  "Florida",
+  "Georgia",
+  "Hawaii",
+  "Idaho",
+  "Illinois",
+  "Indiana",
+  "Iowa",
+  "Kansas",
+  "Kentucky",
+  "Louisiana",
+  "Maine",
+  "Maryland",
+  "Massachusetts",
+  "Michigan",
+  "Minnesota",
+  "Mississippi",
+  "Missouri",
+  "Montana",
+  "Nebraska",
+  "Nevada",
+  "New Hampshire",
+  "New Jersey",
+  "New Mexico",
+  "New York",
+  "North Carolina",
+  "North Dakota",
+  "Ohio",
+  "Oklahoma",
+  "Oregon",
+  "Pennsylvania",
+  "Rhode Island",
+  "South Carolina",
+  "South Dakota",
+  "Tennessee",
+  "Texas",
+  "Utah",
+  "Vermont",
+  "Virginia",
+  "Washington",
+  "West Virginia",
+  "Wisconsin",
+  "Wyoming",
+];
+
+const discoverySources = [
+  "Current Employee",
+  "Search Engine",
+  "LinkedIn",
+  "Other",
+];
+
+const employmentStatuses = [
+  "Unemployed",
+  "Employed",
+  "Self-employed",
+  "Student",
+];
+
+const educationLevels = [
+  "High school diploma or equivalent",
+  "Some college (no degree)",
+  "Associate degree",
+  "Bachelor's degree",
+  "Master's degree",
+  "Doctoral or professional degree",
+];
+
+const inputClassName =
+  "mt-2 w-full border border-[#D8DEE6] bg-white px-4 py-3 text-sm text-[#1F2937] placeholder:text-[#9AA4B2] focus:border-[#2B6FD6] focus:outline-none rounded-md transition-all";
+const EMAILJS_FORM_API_URL = "https://api.emailjs.com/api/v1.0/email/send-form";
+const EMAILJS_PUBLIC_KEY =
+  process.env.NEXT_PUBLIC_EMAILJS_PUBLIC_KEY?.trim() ?? "";
+const EMAILJS_SERVICE_ID =
+  process.env.NEXT_PUBLIC_EMAILJS_SERVICE_ID?.trim() ?? "";
+const EMAILJS_APPLY_TEMPLATE_ID =
+  process.env.NEXT_PUBLIC_EMAILJS_APPLY_TEMPLATE_ID?.trim() ?? "";
+const RECAPTCHA_SITE_KEY =
+  process.env.NEXT_PUBLIC_RECAPTCHA_SITE_KEY?.trim() ?? "";
+const DEFAULT_MAX_TOTAL_ATTACHMENT_BYTES = 500 * 1024; // 기본값 500kb, 환경변수로 설정된 값이 유효한 경우 해당 값 사용
+
+const CONFIGURED_MAX_TOTAL_ATTACHMENT_BYTES = Number(
+  process.env.NEXT_PUBLIC_EMAILJS_MAX_ATTACHMENT_BYTES?.trim(),
+); // 환경변수로 최대 첨부 파일 크기 설정 없을 경우 기본값 사용
+
+const MAX_TOTAL_ATTACHMENT_BYTES =
+  Number.isFinite(CONFIGURED_MAX_TOTAL_ATTACHMENT_BYTES) &&
+  CONFIGURED_MAX_TOTAL_ATTACHMENT_BYTES > 0
+    ? CONFIGURED_MAX_TOTAL_ATTACHMENT_BYTES
+    : DEFAULT_MAX_TOTAL_ATTACHMENT_BYTES;
+    
+const MAX_TOTAL_ATTACHMENT_LABEL = `${Math.round(MAX_TOTAL_ATTACHMENT_BYTES / 1024)} KB`;
+const SUBMIT_SUCCESS_MESSAGE =
+  "Your application has been sent. We will review it and follow up if there is a fit.";
+const SUBMIT_FAILURE_MESSAGE =
+  "We couldn't send your application right now. Please try again or contact us directly.";
+const SUBMIT_RATE_LIMIT_MESSAGE =
+  "Your last application was already sent. Wait a few seconds and try again.";
+const SUBMIT_ATTACHMENT_LIMIT_MESSAGE =
+  "Your resume exceeds the EmailJS attachment limit for this plan. Upload a smaller file and try again.";
+const CAPTCHA_REQUIRED_MESSAGE = "Please confirm you are not a robot.";
+
+type GrecaptchaApi = {
+  getResponse: () => string;
+  reset: () => void;
+  render: (
+    container: HTMLElement,
+    parameters: { sitekey: string },
+  ) => number;
+  ready: (callback: () => void) => void;
+};
+
+type RecaptchaWindow = Window & {
+  grecaptcha?: GrecaptchaApi;
+  onCareerRecaptchaLoad?: () => void;
+};
+
+function getGrecaptcha(): GrecaptchaApi | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+
+  return (window as RecaptchaWindow).grecaptcha ?? null;
+}
+
+function safeCaptchaGetResponse(): string {
+  try {
+    return getGrecaptcha()?.getResponse().trim() ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function safeCaptchaReset(): void {
+  try {
+    getGrecaptcha()?.reset();
+  } catch {
+    // Ignore reset failures from a removed or unavailable widget.
+  }
+}
+
+function getEmailJsFailureMessage(status: number, responseText: string) {
+  const normalizedResponse = responseText.trim();
+  const lowerResponse = normalizedResponse.toLowerCase();
+
+  if (status === 429 || lowerResponse.includes("limit")) {
+    return SUBMIT_RATE_LIMIT_MESSAGE;
+  }
+
+  if (
+    lowerResponse.includes("attachment") ||
+    lowerResponse.includes("file size") ||
+    lowerResponse.includes("payload too large")
+  ) {
+    return SUBMIT_ATTACHMENT_LIMIT_MESSAGE;
+  }
+
+  if (normalizedResponse.length > 0) {
+    return `Email service rejected the application: ${normalizedResponse}`;
+  }
+
+  return SUBMIT_FAILURE_MESSAGE;
+}
+
+export function CareerApplicationForm() {
+  const formRef = useRef<HTMLFormElement>(null);
+  const captchaRef = useRef<HTMLDivElement>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isConfirmingSubmit, setIsConfirmingSubmit] = useState(false);
+  const [submitMessage, setSubmitMessage] = useState("");
+  const [isSubmitError, setIsSubmitError] = useState(false);
+  const [previewData, setPreviewData] = useState<{
+    name: string;
+    email: string;
+    phone: string;
+    positionSource: string;
+  } | null>(null);
+
+  const renderCaptcha = useCallback(() => {
+    const grecaptcha = getGrecaptcha();
+    if (!grecaptcha || !captchaRef.current || !RECAPTCHA_SITE_KEY) {
+      return;
+    }
+
+    grecaptcha.ready(() => {
+      if (!captchaRef.current) {
+        return;
+      }
+
+      const freshDiv = document.createElement("div");
+      captchaRef.current.replaceChildren(freshDiv);
+      grecaptcha.render(freshDiv, {
+        sitekey: RECAPTCHA_SITE_KEY,
+      });
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!RECAPTCHA_SITE_KEY) {
+      return;
+    }
+
+    if (getGrecaptcha()) {
+      renderCaptcha();
+      return;
+    }
+
+    (window as RecaptchaWindow).onCareerRecaptchaLoad = renderCaptcha;
+
+    return () => {
+      (window as RecaptchaWindow).onCareerRecaptchaLoad = undefined;
+    };
+  }, [renderCaptcha]);
+
+  const getSubmissionFormData = (form: HTMLFormElement, captchaToken: string) => {
+    const formData = new FormData(form);
+    const uploadedFiles = ["resume"]
+      .map((fieldName) => formData.get(fieldName))
+      .filter((file): file is File => file instanceof File && file.size > 0);
+    const totalAttachmentBytes = uploadedFiles.reduce(
+      (total, file) => total + file.size,
+      0,
+    );
+
+    if (
+      !EMAILJS_PUBLIC_KEY ||
+      !EMAILJS_SERVICE_ID ||
+      !EMAILJS_APPLY_TEMPLATE_ID ||
+      !RECAPTCHA_SITE_KEY
+    ) {
+      return {
+        errorMessage: "Career form is not configured yet.",
+      };
+    }
+
+    if (!captchaToken) {
+      return {
+        errorMessage: CAPTCHA_REQUIRED_MESSAGE,
+      };
+    }
+
+    if (totalAttachmentBytes > MAX_TOTAL_ATTACHMENT_BYTES) {
+      return {
+        errorMessage: `Attached files must total ${MAX_TOTAL_ATTACHMENT_LABEL} or less.`,
+      };
+    }
+
+    const coverLetterValue = formData.get("coverLetter");
+    if (typeof coverLetterValue === "string") {
+      const normalizedCoverLetter = coverLetterValue.trim();
+      formData.set(
+        "coverLetter",
+        normalizedCoverLetter.length > 0 ? normalizedCoverLetter : "Not provided",
+      );
+    }
+
+    formData.set("service_id", EMAILJS_SERVICE_ID);
+    formData.set("template_id", EMAILJS_APPLY_TEMPLATE_ID);
+    formData.set("user_id", EMAILJS_PUBLIC_KEY);
+    formData.set("g-recaptcha-response", captchaToken);
+
+    return { formData };
+  };
+
+  const submitApplication = async (form: HTMLFormElement) => {
+    const captchaToken = safeCaptchaGetResponse();
+    const { formData, errorMessage } = getSubmissionFormData(form, captchaToken);
+
+    if (!formData) {
+      safeCaptchaReset();
+      setIsSubmitError(true);
+      setSubmitMessage(errorMessage ?? SUBMIT_FAILURE_MESSAGE);
+      setIsConfirmingSubmit(false);
+      return;
+    }
+
+    setIsSubmitting(true);
+    setIsSubmitError(false);
+    setSubmitMessage("");
+
+    try {
+      const response = await fetch(EMAILJS_FORM_API_URL, {
+        method: "POST",
+        body: formData,
+      });
+
+      if (!response.ok) {
+        const responseText = await response.text();
+        throw new Error(getEmailJsFailureMessage(response.status, responseText));
+      }
+
+      form.reset();
+      safeCaptchaReset();
+      setIsConfirmingSubmit(false);
+      setSubmitMessage(SUBMIT_SUCCESS_MESSAGE);
+    } catch (error) {
+      safeCaptchaReset();
+      setIsSubmitError(true);
+      setIsConfirmingSubmit(false);
+      setSubmitMessage(
+        error instanceof Error && error.message
+          ? error.message
+          : SUBMIT_FAILURE_MESSAGE,
+      );
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+
+    if (isSubmitting) {
+      return;
+    }
+
+    const form = event.currentTarget;
+    if (!form.reportValidity()) {
+      return;
+    }
+
+    setIsSubmitError(false);
+    setSubmitMessage("");
+
+    const captchaToken = safeCaptchaGetResponse();
+    const { errorMessage } = getSubmissionFormData(form, captchaToken);
+    if (errorMessage) {
+      if (errorMessage !== CAPTCHA_REQUIRED_MESSAGE) {
+        safeCaptchaReset();
+      }
+      setIsSubmitError(true);
+      setSubmitMessage(errorMessage);
+      setIsConfirmingSubmit(false);
+      return;
+    }
+
+    // Capture preview data
+    const formData = new FormData(form);
+    setPreviewData({
+      name: `${formData.get("firstName")} ${formData.get("lastName")}`,
+      email: String(formData.get("email")),
+      phone: String(formData.get("phone")),
+      positionSource: String(formData.get("discoverySource")),
+    });
+
+    setIsConfirmingSubmit(true);
+  };
+
+  const handleConfirmSubmit = async () => {
+    if (isSubmitting || !formRef.current) {
+      return;
+    }
+
+    await submitApplication(formRef.current);
+  };
+
+  return (
+    <>
+      {RECAPTCHA_SITE_KEY ? (
+        <Script
+          src="https://www.google.com/recaptcha/api.js?onload=onCareerRecaptchaLoad&render=explicit"
+          strategy="afterInteractive"
+        />
+      ) : null}
+
+      <form
+        ref={formRef}
+        onSubmit={handleSubmit}
+        className="space-y-8"
+        encType="multipart/form-data"
+      >
+        <div className="text-center">
+          <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#2B6FD6]">
+            Fill out the job application below, upload your resume, and add a cover letter if you'd like.
+          </p>
+        </div>
+
+        <div className="grid gap-6 md:grid-cols-3">
+          <div>
+            <label
+              htmlFor="firstName"
+              className="text-xs font-semibold uppercase tracking-[0.18em] text-[#2B6FD6]"
+            >
+              First Name *
+            </label>
+            <input
+              id="firstName"
+              name="firstName"
+              type="text"
+              required
+              placeholder="First name"
+              className={inputClassName}
+            />
+          </div>
+          <div>
+            <label
+              htmlFor="middleName"
+              className="text-xs font-semibold uppercase tracking-[0.18em] text-[#2B6FD6]"
+            >
+              Middle Name
+            </label>
+            <input
+              id="middleName"
+              name="middleName"
+              type="text"
+              placeholder="Middle name"
+              className={inputClassName}
+            />
+          </div>
+          <div>
+            <label
+              htmlFor="lastName"
+              className="text-xs font-semibold uppercase tracking-[0.18em] text-[#2B6FD6]"
+            >
+              Last Name *
+            </label>
+            <input
+              id="lastName"
+              name="lastName"
+              type="text"
+              required
+              placeholder="Last name"
+              className={inputClassName}
+            />
+          </div>
+        </div>
+
+        <div>
+          <label
+            htmlFor="email"
+            className="text-xs font-semibold uppercase tracking-[0.18em] text-[#2B6FD6]"
+          >
+            Email *
+          </label>
+          <input
+            id="email"
+            name="email"
+            type="email"
+            required
+            placeholder="name@example.com"
+            className={inputClassName}
+          />
+        </div>
+
+        <div>
+          <label
+            htmlFor="phone"
+            className="text-xs font-semibold uppercase tracking-[0.18em] text-[#2B6FD6]"
+          >
+            Phone *
+          </label>
+          <input
+            id="phone"
+            name="phone"
+            type="tel"
+            required
+            placeholder="123-456-7890"
+            className={inputClassName}
+          />
+        </div>
+
+        <div className="space-y-6">
+          <div>
+            <label
+              htmlFor="addressLine1"
+              className="text-xs font-semibold uppercase tracking-[0.18em] text-[#2B6FD6]"
+            >
+              Address *
+            </label>
+            <input
+              id="addressLine1"
+              name="addressLine1"
+              type="text"
+              required
+              placeholder="Address line 1"
+              className={inputClassName}
+            />
+          </div>
+          <div>
+            <label htmlFor="addressLine2" className="sr-only">
+              Address Line 2
+            </label>
+            <input
+              id="addressLine2"
+              name="addressLine2"
+              type="text"
+              placeholder="Address line 2"
+              className={inputClassName}
+            />
+          </div>
+          <div className="grid gap-6 md:grid-cols-[1.2fr_1fr]">
+            <div>
+              <label htmlFor="city" className="sr-only">
+                City
+              </label>
+              <input
+                id="city"
+                name="city"
+                type="text"
+                required
+                placeholder="City"
+                className={inputClassName}
+              />
+            </div>
+            <div>
+              <label htmlFor="state" className="sr-only">
+                State
+              </label>
+              <select
+                id="state"
+                name="state"
+                defaultValue="Alabama"
+                className={inputClassName}
+              >
+                {states.map((state) => (
+                  <option key={state} value={state}>
+                    {state}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+          <div>
+            <label htmlFor="zipcode" className="sr-only">
+              Zipcode
+            </label>
+            <input
+              id="zipcode"
+              name="zipcode"
+              type="text"
+              required
+              placeholder="Zipcode"
+              className={inputClassName}
+            />
+          </div>
+        </div>
+
+        <fieldset className="space-y-3">
+          <legend className="text-xs font-semibold uppercase tracking-[0.18em] text-[#2B6FD6]">
+            How did you find out about this position? *
+          </legend>
+          <div className="flex flex-wrap gap-x-6 gap-y-3 text-sm text-[#4B5563]">
+            {discoverySources.map((source) => (
+              <label key={source} className="inline-flex items-center gap-2 cursor-pointer group">
+                <input
+                  type="radio"
+                  name="discoverySource"
+                  value={source}
+                  required
+                  className="h-4 w-4 border-[#B8C2CF] text-[#2B6FD6] accent-[#2B6FD6]"
+                />
+                <span className="group-hover:text-[#2B6FD6] transition-colors">{source}</span>
+              </label>
+            ))}
+          </div>
+        </fieldset>
+
+        <fieldset className="space-y-3">
+          <legend className="text-xs font-semibold uppercase tracking-[0.18em] text-[#2B6FD6]">
+            Current Employment Status *
+          </legend>
+          <div className="flex flex-wrap gap-x-6 gap-y-3 text-sm text-[#4B5563]">
+            {employmentStatuses.map((status) => (
+              <label key={status} className="inline-flex items-center gap-2 cursor-pointer group">
+                <input
+                  type="radio"
+                  name="employmentStatus"
+                  value={status}
+                  required
+                  className="h-4 w-4 border-[#B8C2CF] text-[#2B6FD6] accent-[#2B6FD6]"
+                />
+                <span className="group-hover:text-[#2B6FD6] transition-colors">{status}</span>
+              </label>
+            ))}
+          </div>
+        </fieldset>
+
+        <fieldset className="space-y-3">
+          <legend className="text-xs font-semibold uppercase tracking-[0.18em] text-[#2B6FD6]">
+            Highest Education Level *
+          </legend>
+          <div className="flex flex-wrap gap-x-6 gap-y-3 text-sm text-[#4B5563]">
+            {educationLevels.map((level) => (
+              <label key={level} className="inline-flex items-center gap-2 cursor-pointer group">
+                <input
+                  type="radio"
+                  name="educationLevel"
+                  value={level}
+                  required
+                  className="h-4 w-4 border-[#B8C2CF] text-[#2B6FD6] accent-[#2B6FD6]"
+                />
+                <span className="group-hover:text-[#2B6FD6] transition-colors">{level}</span>
+              </label>
+            ))}
+          </div>
+        </fieldset>
+
+        <div className="space-y-6">
+          <div>
+            <label
+              htmlFor="coverLetter"
+              className="text-xs font-semibold uppercase tracking-[0.18em] text-[#2B6FD6]"
+            >
+              Cover Letter (Optional)
+            </label>
+            <textarea
+              id="coverLetter"
+              name="coverLetter"
+              rows={6}
+              placeholder="Write your cover letter here."
+              className={`${inputClassName} resize-y`}
+            />
+          </div>
+          <div>
+            <label
+              htmlFor="resume"
+              className="text-xs font-semibold uppercase tracking-[0.18em] text-[#2B6FD6]"
+            >
+              Upload Your Resume *
+            </label>
+            <input
+              id="resume"
+              name="resume"
+              type="file"
+              required
+              accept=".pdf,.doc,.docx"
+              className={`${inputClassName} cursor-pointer file:mr-4 file:border-0 file:bg-[#1C2746] file:px-4 file:py-2 file:text-sm file:font-medium file:text-white file:rounded-md transition-all`}
+            />
+          </div>
+        </div>
+
+        <div>
+          <label
+            htmlFor="additionalInformation"
+            className="text-xs font-semibold uppercase tracking-[0.18em] text-[#2B6FD6]"
+          >
+            Additional Information
+          </label>
+          <textarea
+            id="additionalInformation"
+            name="additionalInformation"
+            rows={5}
+            placeholder="Share anything else you'd like us to know."
+            className={`${inputClassName} resize-y`}
+          />
+        </div>
+
+        {RECAPTCHA_SITE_KEY ? (
+          <div ref={captchaRef} className="overflow-x-auto" />
+        ) : (
+          <p className="text-sm text-[#B42318]">
+            reCAPTCHA site key is missing.
+          </p>
+        )}
+
+        <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+          <button
+            type="submit"
+            disabled={isSubmitting}
+            className="inline-flex justify-center bg-[#1C2746] px-10 py-3 text-sm font-semibold uppercase tracking-[0.2em] text-white transition-all hover:bg-[#2B6FD6] hover:shadow-lg active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-70 rounded-md"
+          >
+            {isSubmitting ? "Sending..." : "Submit"}
+          </button>
+          <p className="text-sm text-[#6B7280]">
+            Accepted resume files: PDF, DOC, DOCX. Total upload size up to{" "}
+            {MAX_TOTAL_ATTACHMENT_LABEL}.
+          </p>
+        </div>
+
+        {submitMessage ? (
+          <p
+            role="status"
+            aria-live="polite"
+            className={`text-sm ${isSubmitError ? "text-[#B42318]" : "text-[#1F2937]"}`}
+          >
+            {submitMessage}
+          </p>
+        ) : null}
+      </form>
+
+      <SubmissionConfirmDialog
+        open={isConfirmingSubmit}
+        onOpenChange={setIsConfirmingSubmit}
+        isSubmitting={isSubmitting}
+        title="Confirm Application Submission"
+        description="Please review your details before submitting your application."
+        fields={[
+          { label: "Name", value: previewData?.name },
+          { label: "Phone", value: previewData?.phone },
+          { label: "Email", value: previewData?.email, fullWidth: true },
+          {
+            label: "How you found us",
+            value: previewData?.positionSource,
+            fullWidth: true,
+          },
+        ]}
+        notice={
+          <p>
+            By clicking "Submit", your application and attached resume will be
+            sent to Wellins Recruiting team. You cannot edit your response after
+            submission.
+          </p>
+        }
+        cancelLabel="Back to Edit"
+        confirmLabel="Confirm & Submit"
+        onConfirm={handleConfirmSubmit}
+      />
+    </>
+  );
+}
